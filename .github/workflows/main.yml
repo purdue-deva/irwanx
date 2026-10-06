@@ -1,0 +1,688 @@
+name: ubuntu-server-ephemeral
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 */5 * * *"
+
+concurrency:
+  group: tailscale-exit-node
+  cancel-in-progress: true
+
+jobs:
+  ubuntu-server:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Server
+        run: |
+          sudo timedatectl set-timezone Asia/Jakarta
+          sudo systemctl start ssh
+          sudo systemctl enable ssh
+
+      - name: Install Network Core & Utilities
+        run: |
+          curl -fsSL https://tailscale.com/install.sh | sh
+          sudo tailscale up \
+            --authkey="${{ secrets.TAILSCALE_AUTH_KEY }}" \
+            --hostname="ubuntu-azure-temp" \
+            --accept-routes \
+            --advertise-exit-node
+
+          curl -L \
+            --output cloudflared.deb \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+          sudo dpkg -i cloudflared.deb
+          sudo cloudflared service install \
+            "${{ secrets.CF_TUNNEL_TOKEN }}"
+
+          sudo apt-get update -y
+          sudo apt-get install -y \
+            speedtest-cli \
+            nmap \
+            jq \
+            curl \
+            tar \
+            unzip \
+            neofetch \
+            wget \
+            ttyd
+
+          sudo mkdir -p /root/uploads
+          sudo chmod 777 /root/uploads
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Clone API Drama and Setup Prisma
+        run: |
+          git clone https://${{ secrets.GH_PAT }}@github.com/irwanx/api-drama.git /root/api-drama
+          cd /root/api-drama
+          cp .env.example .env
+          npm install -g pm2
+          npm install
+          npx prisma generate
+          pm2 start npm --name "api-drama" -- start
+
+      - name: Start Web Terminal & File Server
+        run: |
+          sudo pkill -9 ttyd || true
+          
+          nohup sudo -E env "PATH=$PATH" npx -y http-server /root/uploads -p 8090 \
+            > /tmp/http-server.log 2>&1 &
+            
+          nohup sudo ttyd \
+            -W \
+            -p 7681 \
+            -c "${{ secrets.TTYD_USER }}:${{ secrets.TTYD_PASS }}" \
+            bash \
+            > /tmp/ttyd.log 2>&1 &
+
+      - name: Setup Panel
+        run: |
+          if [ -f panel.sh ]; then
+            sudo cp panel.sh /root/panel.sh
+            sudo chmod +x /root/panel.sh
+          fi
+
+      - name: Get Tailscale IP
+        run: |
+          TAILSCALE_IP="$(tailscale ip -4)"
+          echo "TAILSCALE_IP=$TAILSCALE_IP" >> "$GITHUB_ENV"
+          echo "Tailscale IP: $TAILSCALE_IP"
+
+      - name: Run Telegram Control Bot
+        shell: bash
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          OWNER_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          set +e
+          set +o pipefail
+
+          send_msg() {
+            local msg="$1"
+            jq -n \
+              --arg chat_id "$OWNER_ID" \
+              --arg text "$msg" \
+              '{
+                chat_id: $chat_id,
+                text: $text,
+                parse_mode: "HTML"
+              }' |
+            curl -sS -X POST \
+              "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+              -H "Content-Type: application/json" \
+              -d @- \
+              > /dev/null
+          }
+
+          TAILSCALE_IP="$(tailscale ip -4)"
+
+          curl -sS -X POST \
+            "https://api.telegram.org/bot${BOT_TOKEN}/setMyCommands" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "commands": [
+                {
+                  "command": "help",
+                  "description": "Panduan command"
+                },
+                {
+                  "command": "status",
+                  "description": "Status CPU dan RAM"
+                },
+                {
+                  "command": "ip",
+                  "description": "Lihat IP server"
+                },
+                {
+                  "command": "log",
+                  "description": "Cek log API Drama"
+                },
+                {
+                  "command": "restartapi",
+                  "description": "Restart API Drama"
+                },
+                {
+                  "command": "neofetch",
+                  "description": "Detail sistem"
+                },
+                {
+                  "command": "speedtest",
+                  "description": "Test internet"
+                },
+                {
+                  "command": "fetch",
+                  "description": "Ambil file dari server"
+                },
+                {
+                  "command": "scanhost",
+                  "description": "Scan host"
+                },
+                {
+                  "command": "kill",
+                  "description": "Matikan proses"
+                },
+                {
+                  "command": "cmd",
+                  "description": "Jalankan Bash"
+                }
+              ]
+            }' > /dev/null
+
+          LATEST="$(curl -sS \
+            "https://api.telegram.org/bot${BOT_TOKEN}/getUpdates")"
+
+          LAST_ID="$(echo "$LATEST" |
+            jq -r '.result[-1].update_id // empty')"
+
+          if [ -n "$LAST_ID" ] && [ "$LAST_ID" != "null" ]; then
+            OFFSET=$((LAST_ID + 1))
+          else
+            OFFSET=0
+          fi
+
+          ONLINE_MSG=$(cat <<EOF
+          🟢 <b>UBUNTU SERVER ONLINE</b>
+
+          ━━━━━━━━━━━━━━━━━━
+
+          🌐 <b>NETWORK</b>
+          Tailscale IP:
+          <code>${TAILSCALE_IP}</code>
+
+          🖥️ <b>API DRAMA</b>
+          <code>http://${TAILSCALE_IP}:8080</code>
+
+          🖥️ <b>WEB TERMINAL</b>
+          <code>http://${TAILSCALE_IP}:7681</code>
+
+          📁 <b>FILE SERVER</b>
+          <code>http://${TAILSCALE_IP}:8090</code>
+
+          🤖 <b>TELEGRAM BOT</b>
+          Status: ONLINE
+
+          🔐 <b>OWNER</b>
+          <code>${OWNER_ID}</code>
+
+          ━━━━━━━━━━━━━━━━━━
+          Server siap digunakan.
+          EOF
+          )
+
+          send_msg "$ONLINE_MSG"
+
+          while true; do
+            UPDATES="$(curl -sS \
+              --max-time 40 \
+              "https://api.telegram.org/bot${BOT_TOKEN}/getUpdates?offset=${OFFSET}&timeout=30")"
+
+            for ROW in $(echo "$UPDATES" |
+              jq -r '.result[] | @base64' 2>/dev/null); do
+
+              DECODED="$(echo "$ROW" | base64 --decode)"
+
+              UPDATE_ID="$(echo "$DECODED" |
+                jq -r '.update_id // empty')"
+
+              if [ -z "$UPDATE_ID" ]; then
+                continue
+              fi
+
+              OFFSET=$((UPDATE_ID + 1))
+
+              USER_ID="$(echo "$DECODED" |
+                jq -r '.message.from.id // empty')"
+
+              if [ "$USER_ID" != "$OWNER_ID" ]; then
+                continue
+              fi
+
+              DOC_ID="$(echo "$DECODED" |
+                jq -r '(
+                  .message.document.file_id //
+                  .message.photo[-1].file_id //
+                  .message.video.file_id //
+                  .message.audio.file_id //
+                  empty
+                )')"
+
+              if [ -n "$DOC_ID" ]; then
+
+                DOC_NAME="$(echo "$DECODED" |
+                  jq -r '(
+                    .message.document.file_name //
+                    .message.video.file_name //
+                    .message.audio.file_name //
+                    empty
+                  )')"
+
+                if [ -z "$DOC_NAME" ]; then
+                  DOC_NAME="media_$(date +%s)"
+                fi
+
+                DOC_NAME="$(basename "$DOC_NAME")"
+
+                send_msg \
+                  "📥 <b>DOWNLOAD</b>
+
+          Mengunduh:
+          <code>${DOC_NAME}</code>"
+
+                FILE_INFO="$(curl -sS \
+                  "https://api.telegram.org/bot${BOT_TOKEN}/getFile?file_id=${DOC_ID}")"
+
+                FILE_PATH="$(echo "$FILE_INFO" |
+                  jq -r '.result.file_path // empty')"
+
+                if [ -n "$FILE_PATH" ]; then
+
+                  if sudo curl -fsSL \
+                    -o "/root/uploads/${DOC_NAME}" \
+                    "https://api.telegram.org/file/bot${BOT_TOKEN}/${FILE_PATH}"; then
+
+                    send_msg \
+                      "✅ <b>FILE TERSIMPAN</b>
+
+          <code>/root/uploads/${DOC_NAME}</code>"
+
+                  else
+
+                    send_msg \
+                      "❌ Gagal mengunduh file."
+
+                  fi
+
+                else
+
+                  send_msg \
+                    "❌ Telegram tidak memberikan file path."
+
+                fi
+
+                continue
+              fi
+
+              TEXT="$(echo "$DECODED" |
+                jq -r '.message.text // .message.caption // empty')"
+
+              if [ -z "$TEXT" ]; then
+                continue
+              fi
+
+              if [[ "$TEXT" != /* ]]; then
+                continue
+              fi
+
+              CMD="$(echo "$TEXT" | awk '{print $1}')"
+
+              ARGS="$(echo "$TEXT" |
+                cut -s -d' ' -f2- |
+                sed \
+                  -e 's/^[[:space:]]*//' \
+                  -e 's/[[:space:]]*$//')"
+
+              case "$CMD" in
+
+                /help|/start)
+
+                  HELP_MSG=$(cat <<'EOF'
+          🤖 <b>COMMAND CENTER</b>
+
+          ━━━━━━━━━━━━━━━━━━
+
+          <b>SERVER</b>
+
+          /status
+          /ip
+          /log
+          /restartapi
+          /neofetch
+          /speedtest
+
+          <b>FILE</b>
+
+          /fetch /path/file
+
+          <b>NETWORK</b>
+
+          /scanhost IP/domain
+
+          <b>PROCESS</b>
+
+          /kill nama_proses
+
+          <b>SHELL</b>
+
+          /cmd command
+
+          ━━━━━━━━━━━━━━━━━━
+          EOF
+          )
+
+                  send_msg "$HELP_MSG"
+                  ;;
+
+                /ip)
+
+                  IP_MSG=$(cat <<EOF
+          🌐 <b>NETWORK INFO</b>
+
+          Tailscale IP:
+          <code>${TAILSCALE_IP}</code>
+
+          API Drama:
+          <code>http://${TAILSCALE_IP}:8080</code>
+
+          Web Terminal:
+          <code>http://${TAILSCALE_IP}:7681</code>
+
+          File Server:
+          <code>http://${TAILSCALE_IP}:8090</code>
+          EOF
+          )
+
+                  send_msg "$IP_MSG"
+                  ;;
+
+                /log)
+                  OUT="$(pm2 logs api-drama --lines 30 --nostream --raw 2>&1)"
+                  
+                  if [ -z "$OUT" ]; then
+                    OUT="(Log kosong)"
+                  fi
+
+                  OUT="$(echo "$OUT" |
+                    sed \
+                      's/&/\&amp;/g;
+                       s/</\&lt;/g;
+                       s/>/\&gt;/g')"
+
+                  send_msg \
+                    "📄 <b>API DRAMA LOG</b> (Last 30 lines)
+
+          <pre>${OUT}</pre>"
+                  ;;
+
+                /restartapi)
+                  send_msg "🔄 Merestart API Drama..."
+                  pm2 restart api-drama
+                  send_msg "✅ API Drama berhasil direstart melalui PM2."
+                  ;;
+
+                /neofetch)
+
+                  OUT="$(neofetch --stdout 2>&1)"
+
+                  OUT="$(echo "$OUT" |
+                    sed \
+                      's/&/\&amp;/g;
+                       s/</\&lt;/g;
+                       s/>/\&gt;/g')"
+
+                  send_msg \
+                    "🖥️ <b>SYSTEM INFO</b>
+
+          <pre>${OUT}</pre>"
+                  ;;
+
+                /status)
+
+                  CPU_MODEL="$(awk \
+                    -F: \
+                    '/model name/ {print $2; exit}' \
+                    /proc/cpuinfo |
+                    xargs)"
+
+                  RAM_USED="$(free -m |
+                    awk '/Mem:/ {print $3}')"
+
+                  RAM_TOTAL="$(free -m |
+                    awk '/Mem:/ {print $2}')"
+
+                  CPU_VAL="$(top -bn1 |
+                    awk '/Cpu/ {print $2 + $4}')"
+
+                  UP="$(uptime -p)"
+
+                  STATUS_MSG=$(cat <<EOF
+          📊 <b>SERVER STATUS</b>
+
+          CPU:
+          <code>${CPU_MODEL}</code>
+
+          CPU Load:
+          <code>${CPU_VAL}%</code>
+
+          RAM:
+          <code>${RAM_USED} MB / ${RAM_TOTAL} MB</code>
+
+          Uptime:
+          <code>${UP}</code>
+          EOF
+          )
+
+                  send_msg "$STATUS_MSG"
+                  ;;
+
+                /speedtest)
+
+                  send_msg "🌐 Menjalankan speedtest..."
+
+                  OUT="$(speedtest-cli --simple 2>&1)"
+
+                  OUT="$(echo "$OUT" |
+                    sed \
+                      's/&/\&amp;/g;
+                       s/</\&lt;/g;
+                       s/>/\&gt;/g')"
+
+                  send_msg \
+                    "📡 <b>SPEEDTEST RESULT</b>
+
+          <pre>${OUT}</pre>"
+                  ;;
+
+                /scanhost)
+
+                  if [ -z "$ARGS" ]; then
+
+                    send_msg \
+                      "❌ Gunakan:
+
+          <code>/scanhost IP/domain</code>"
+
+                  else
+
+                    OUT="$(sudo nmap -Pn -F "$ARGS" 2>&1)"
+
+                    OUT="$(echo "$OUT" |
+                      sed \
+                        's/&/\&amp;/g;
+                         s/</\&lt;/g;
+                         s/>/\&gt;/g')"
+
+                    send_msg \
+                      "🔎 <b>NMAP RESULT</b>
+
+          <pre>${OUT}</pre>"
+
+                  fi
+                  ;;
+
+                /kill)
+
+                  if [ -z "$ARGS" ]; then
+
+                    send_msg \
+                      "❌ Masukkan nama proses."
+
+                  elif [[ "$ARGS" == *"bash"* ]] ||
+                       [[ "$ARGS" == *"curl"* ]] ||
+                       [[ "$ARGS" == *"ttyd"* ]] ||
+                       [[ "$ARGS" == *"Telegram"* ]]; then
+
+                    send_msg \
+                      "🛡️ Command ditolak untuk melindungi bot."
+
+                  else
+
+                    OUT="$(sudo pkill -9 -f "$ARGS" 2>&1 &&
+                      echo "Killed" ||
+                      echo "Not Found")"
+
+                    send_msg \
+                      "☠️ <b>KILL PROCESS</b>
+
+          <pre>${OUT}</pre>"
+
+                  fi
+                  ;;
+
+                /fetch)
+
+                  if [ -z "$ARGS" ]; then
+
+                    send_msg \
+                      "❌ Gunakan:
+
+          <code>/fetch /path/file</code>"
+
+                  elif [ -f "$ARGS" ]; then
+
+                    send_msg \
+                      "📤 Mengunggah:
+
+          <code>${ARGS}</code>"
+
+                    curl -sS -X POST \
+                      "https://api.telegram.org/bot${BOT_TOKEN}/sendDocument" \
+                      -F "chat_id=${OWNER_ID}" \
+                      -F "document=@${ARGS}" \
+                      > /dev/null
+
+                  else
+
+                    send_msg \
+                      "❌ File tidak ditemukan:
+
+          <code>${ARGS}</code>"
+
+                  fi
+                  ;;
+
+                /cmd)
+
+                  if [ -z "$ARGS" ]; then
+
+                    send_msg \
+                      "❌ Gunakan:
+
+          <code>/cmd command</code>"
+
+                  elif [[ "$ARGS" == cd\ * ]]; then
+
+                    DIR="${ARGS#cd }"
+
+                    if cd "$DIR" 2>/dev/null; then
+
+                      send_msg \
+                        "📁 Directory:
+
+          <code>$(pwd)</code>"
+
+                    else
+
+                      send_msg \
+                        "❌ Directory tidak ditemukan."
+
+                    fi
+
+                  else
+
+                    OUT="$(sudo bash -c "$ARGS" 2>&1)"
+
+                    if [ -z "$OUT" ]; then
+                      OUT="(Sukses / Tidak ada output)"
+                    fi
+
+                    OUT="$(echo "$OUT" |
+                      sed \
+                        's/&/\&amp;/g;
+                         s/</\&lt;/g;
+                         s/>/\&gt;/g')"
+
+                    send_msg \
+                      "⚙️ <b>BASH OUTPUT</b>
+
+          <pre>${OUT}</pre>"
+
+                  fi
+                  ;;
+
+                *)
+
+                  send_msg \
+                    "⚠️ Command <code>${CMD}</code> tidak dikenali.
+
+          Ketik /help."
+
+                  ;;
+
+              esac
+
+            done
+
+            sleep 1
+          done
+
+      - name: Cleanup & Offline Notification
+        if: always()
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          OWNER_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          echo "==== CLEANUP START ===="
+
+          OFFLINE_MSG=$(cat <<'EOF'
+          🔴 <b>UBUNTU SERVER OFFLINE</b>
+
+          ━━━━━━━━━━━━━━━━━━
+
+          Workflow telah berhenti atau masuk tahap cleanup.
+
+          Tailscale akan diputus.
+
+          ━━━━━━━━━━━━━━━━━━
+          EOF
+          )
+
+          jq -n \
+            --arg chat_id "$OWNER_ID" \
+            --arg text "$OFFLINE_MSG" \
+            '{
+              chat_id: $chat_id,
+              text: $text,
+              parse_mode: "HTML"
+            }' |
+          curl -sS -X POST \
+            "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+            -H "Content-Type: application/json" \
+            -d @- \
+            > /dev/null || true
+
+          echo "[1/2] Stopping Node..."
+          pkill -9 node || true
+
+          echo "[2/2] Logging out Tailscale..."
+          sudo tailscale logout || true
+
+          echo "==== CLEANUP COMPLETE ===="
