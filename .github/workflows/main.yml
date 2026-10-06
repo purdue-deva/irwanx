@@ -65,7 +65,7 @@ jobs:
           git clone https://${{ secrets.GH_PAT }}@github.com/irwanx/api-drama.git api-drama
           cd api-drama
           cp .env.example .env
-          npm install -g pm2
+          sudo npm install -g pm2
           npm install
           npx prisma generate
           pm2 start npm --name "api-drama" -- start
